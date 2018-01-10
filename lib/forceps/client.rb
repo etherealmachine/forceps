@@ -61,7 +61,12 @@ module Forceps
       end
       head.const_set(class_name, build_new_remote_class(klass))
 
-      remote_class_for(full_class_name).establish_connection :remote
+      remote_class = remote_class_for(full_class_name)
+      if remote_class.respond_to? :octopus_establish_connection
+        remote_class.octopus_establish_connection :remote
+      else
+        remote_class.establish_connection :remote
+      end
     end
 
     def build_new_remote_class(local_class)
