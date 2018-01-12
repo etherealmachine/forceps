@@ -57,6 +57,7 @@ ActiveRecord::Schema.define(version: 20140117112556) do
 
   create_table "users", force: :cascade do |t|
     t.string   "name"
+    t.integer  "address_id"
     t.datetime "created_at"
     t.datetime "updated_at"
   end

@@ -1,3 +1,5 @@
+require 'graphviz'
+
 module Forceps
   module ActsAsCopyableModel
     extend ActiveSupport::Concern
@@ -6,6 +8,16 @@ module Forceps
       without_record_timestamps do
         DeepCopier.new(forceps_options).copy(self)
       end
+    end
+
+    def as_graph
+      g = GraphViz.new( :G, :type => :digraph )
+
+      root = g.add_nodes( self.class.name )
+
+      g.output( :png => 'graph.png' )
+
+      DeepCopier.new(dry_run: true, graph: g).copy(self)
     end
 
     private
@@ -108,7 +120,7 @@ module Forceps
 
         cloned_object = base_class.new
         copy_attributes(cloned_object, simple_attributes_to_copy(remote_object))
-        cloned_object.save!(validate: false)
+        cloned_object.save!(validate: false) unless options[:dry_run]
         invoke_callbacks(:after_each, cloned_object, remote_object)
         cloned_object
       end
@@ -178,7 +190,7 @@ module Forceps
         debug "#{as_trace(source_remote_object)} reusing..."
         # update_columns skips callbacks too but not available in Rails 3
         copy_attributes(target_local_object, simple_attributes_to_copy(source_remote_object))
-        target_local_object.save!(validate: false)
+        target_local_object.save!(validate: false) unless options[:dry_run]
       end
 
       def logger
@@ -206,7 +218,7 @@ module Forceps
         with_nested_logging do
           [:has_one, :has_many, :has_and_belongs_to_many].each do |association_kind|
             copy_objects_associated_by_association_kind(local_object, remote_object, association_kind)
-            local_object.save!(validate: false)
+            local_object.save!(validate: false) unless options[:dry_run]
           end
         end
       end
