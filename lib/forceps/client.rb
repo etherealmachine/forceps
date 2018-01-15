@@ -63,7 +63,11 @@ module Forceps
 
       remote_class = remote_class_for(full_class_name)
       if remote_class.respond_to? :octopus_establish_connection
-        remote_class.octopus_establish_connection :remote
+        if remote_class.side_database_name
+          remote_class.octopus_establish_connection "remote_#{remote_class.side_database_name}".to_sym
+        else
+          remote_class.octopus_establish_connection :remote_main
+        end
       else
         remote_class.establish_connection :remote
       end
