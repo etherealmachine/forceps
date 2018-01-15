@@ -58,18 +58,24 @@ module Forceps
 
       def as_graph
         g = GraphViz.new(:G, :type => :digraph)
-        @nodes.each do |node|
-          g.add_nodes(node)
-        end
+        added = Set.new
         @edges.each do |parent, children|
           children.each do |child, association_kinds|
             association_kinds.each do |association_kind, count|
-              g.add_edges(parent, child, :label => "#{association_kind}: #{count}")
+              next if count == 0
+              g.add_nodes(parent) unless added.include? parent
+              g.add_nodes(child) unless added.include? child
+              if association_kind == :has_many || association_kind == :has_and_belongs_to_many
+                g.add_edges(parent, child, :label => "#{association_kind}: #{count}")
+              else
+                g.add_edges(parent, child, :label => "#{association_kind}")
+              end
             end
           end
         end
         @exceptions.each do |obj, association, association_kind, exception|
-          g.add_edges(to_local_class_name(obj), association.class_name, :label => "#{association_kind}")
+          next if exception.is_a? MaxLevelReachedError
+          g.add_edges(to_local_class_name(obj.class.name), association.class_name, :label => "Exception: #{association_kind}")
         end
         g
       end
