@@ -15,7 +15,7 @@ module Forceps
       options[:max_level] = max_level
       tracer = Tracer.new(options)
       begin
-        tracer.trace(self)
+        tracer.trace(self.class)
       rescue MaxLevelReachedError
       end
       tracer
@@ -43,39 +43,37 @@ module Forceps
         @options = options
         @level = 0
         @nodes = Set.new
-        @edges = Hash.new { |h, k| h[k] = Hash.new { |h, k| h[k] = Hash.new { |h, k| h[k] = 0 } } }
+        @edges = Hash.new { |h, k| h[k] = Hash.new }
         @exceptions = []
       end
 
-      def trace(remote_object)
-        return if @nodes.include?(to_local_class_name(remote_object.class.name))
+      def trace(remote_class)
         with_new_level do
           [:belongs_to, :has_one, :has_many, :has_and_belongs_to_many].each do |association_kind|
-            follow_objects_associated_by_association_kind(remote_object, association_kind) if remote_object
+            follow_objects_associated_by_association_kind(remote_class, association_kind) if remote_class
           end
         end
+      end
+
+      def to_local_class_name(remote_class)
+        remote_class.name.gsub('Forceps::Remote::', '')
       end
 
       def as_graph
         g = GraphViz.new(:G, :type => :digraph)
-        added = Set.new
         @edges.each do |parent, children|
-          children.each do |child, association_kinds|
-            association_kinds.each do |association_kind, count|
-              next if count == 0
-              g.add_nodes(parent) unless added.include? parent
-              g.add_nodes(child) unless added.include? child
-              if association_kind == :has_many || association_kind == :has_and_belongs_to_many
-                g.add_edges(parent, child, :label => "#{association_kind}: #{count}")
-              else
-                g.add_edges(parent, child, :label => "#{association_kind}")
-              end
-            end
+          children.each do |child, edge|
+            association_kind, association = edge
+            parent_name = to_local_class_name(parent)
+            child_name = to_local_class_name(child)
+            g.add_nodes(parent_name)
+            g.add_nodes(child_name)
+            g.add_edges(parent_name, child_name, :label => "#{association_kind}")
           end
         end
-        @exceptions.each do |obj, association, association_kind, exception|
+        @exceptions.each do |remote_class, association, association_kind, exception|
           next if exception.is_a? MaxLevelReachedError
-          g.add_edges(to_local_class_name(obj.class.name), association.class_name, :label => "Exception: #{association_kind}")
+          g.add_edges(to_local_class_name(remote_class), association.class_name, :label => "Exception: #{association_kind}")
         end
         g
       end
@@ -89,85 +87,58 @@ module Forceps
         @level -= 1
       end
 
-      def to_local_class_name(remote_class_name)
-        remote_class_name.gsub('Forceps::Remote::', '')
-      end
-
-      def follow_objects_associated_by_association_kind(remote_object, association_kind)
-        return if options.fetch(:ignore_model, []).include?(remote_object.class.base_class.name)
-        associations = associations_to_follow(remote_object, association_kind)
-        associations.each do |association|
-          next if has_association(remote_object, association, association_kind)
-          begin
-            send "follow_associated_objects_in_#{association_kind}", remote_object, association
-          rescue Exception => e
-            @exceptions << [remote_object, association, association_kind, e]
-          end
-        end
-      end
-
-      def attributes_to_exclude(remote_object)
+      def attributes_to_exclude(remote_class)
         @attributes_to_exclude_map ||= {}
-        @attributes_to_exclude_map[remote_object.class.base_class] ||= calculate_attributes_to_exclude(remote_object)
+        @attributes_to_exclude_map[remote_class.base_class] ||= calculate_attributes_to_exclude(remote_class)
       end
 
-      def calculate_attributes_to_exclude(remote_object)
-        ((options[:exclude] && options[:exclude][remote_object.class.base_class]) || []).collect(&:to_sym)
+      def calculate_attributes_to_exclude(remote_class)
+        ((options[:exclude] && options[:exclude][remote_class.base_class]) || []).collect(&:to_sym)
       end
 
-      def associations_to_follow(remote_object, association_kind)
-        excluded_attributes = attributes_to_exclude(remote_object)
-        remote_object.class.reflect_on_all_associations(association_kind).reject do |association|
+      def associations_to_follow(remote_class, association_kind)
+        excluded_attributes = attributes_to_exclude(remote_class)
+        remote_class.reflect_on_all_associations(association_kind).reject do |association|
           association.options[:through] ||
             excluded_attributes.include?(:all_associations) ||
             excluded_attributes.include?(association.name) ||
-            (!association.options[:polymorphic] && options.fetch(:ignore_model, []).include?(to_local_class_name(association.klass.name)))
+            (!association.options[:polymorphic] && options.fetch(:ignore_model, []).include?(to_local_class_name(association.klass)))
         end
       end
 
-      def add_association(parent, association, association_kind, count)
-        parent_node = to_local_class_name(parent.class.name)
-        child_node = association.class_name
+      def add_association(parent, association, association_kind)
+        @nodes.add(parent)
+        @nodes.add(association.klass)
 
-        @nodes.add(parent_node)
-        @nodes.add(child_node)
-
-        @edges[parent_node][child_node][association_kind] = count
+        @edges[parent][association.klass] = [association_kind, association]
       end
 
       def has_association(parent, association, association_kind)
-        parent_node = to_local_class_name(parent.class.name)
-        child_node = association.class_name
-        return @edges[parent_node][child_node][association_kind] > 0
+        return @edges[parent][association.klass]
       end
 
-      def follow_associated_objects_in_has_many(remote_object, association)
-        add_association(remote_object, association, :has_many, remote_object.send(association.name).count)
-        remote_associated_object = remote_object.send(association.name).find_each.first
-        trace(remote_associated_object) if remote_associated_object
-      end
-
-      def follow_associated_objects_in_has_one(remote_object, association)
-        add_association(remote_object, association, :has_one, 1)
-        remote_associated_object = remote_object.send(association.name)
-        trace(remote_associated_object) if remote_associated_object
-      end
-
-      def follow_associated_objects_in_belongs_to(remote_object, association)
-        add_association(remote_object, association, :belongs_to, 1)
-        with_new_level do
-          associations_to_follow(remote_object, :belongs_to).each do |association|
-            next if has_association(remote_object, association, :belongs_to)
-            remote_associated_object = remote_object.send(association.name)
-            trace(remote_associated_object) if remote_associated_object
+      def follow_objects_associated_by_association_kind(remote_class, association_kind)
+        return if options.fetch(:ignore_model, []).include?(remote_class.base_class.name)
+        associations = associations_to_follow(remote_class, association_kind)
+        associations.each do |association|
+          begin
+            next if has_association(remote_class, association, association_kind)
+            add_association(remote_class, association, association_kind)
+            case association_kind
+            when :has_many, :has_one, :has_and_belongs_to_many
+              trace(association.klass)
+            when :belongs_to
+              with_new_level do
+                associations_to_follow(remote_class, :belongs_to).each do |association|
+                  next if has_association(remote_class, association, :belongs_to)
+                  trace(association.klass)
+                end
+              end
+            end
+          rescue Exception => e
+            @exceptions << [remote_class, association, association_kind, e]
           end
         end
-      end
-
-      def follow_associated_objects_in_has_and_belongs_to_many(remote_object, association)
-        add_association(remote_object, association, :has_and_belongs_to_many, remote_object.send(association.name).count)
-        remote_associated_object = remote_object.send(association.name).find_each.first
-        trace(remote_associated_object) if remote_associated_object
       end
 
     end
