@@ -1,4 +1,4 @@
-require 'graphviz'
+require "forceps/utils"
 
 module Forceps
   module ActsAsCopyableModel
@@ -34,116 +34,8 @@ module Forceps
       Forceps.client.options
     end
 
-    class MaxLevelReachedError < StandardError; end
-
-    class Tracer
-      attr_accessor :options, :level, :nodes, :edges, :exceptions
-
-      def initialize(options)
-        @options = options
-        @level = 0
-        @nodes = Set.new
-        @edges = Hash.new { |h, k| h[k] = Hash.new }
-        @exceptions = []
-      end
-
-      def trace(remote_class)
-        with_new_level do
-          [:belongs_to, :has_one, :has_many, :has_and_belongs_to_many].each do |association_kind|
-            follow_objects_associated_by_association_kind(remote_class, association_kind) if remote_class
-          end
-        end
-      end
-
-      def to_local_class_name(remote_class)
-        remote_class.name.gsub('Forceps::Remote::', '')
-      end
-
-      def as_graph
-        g = GraphViz.new(:G, :type => :digraph)
-        @edges.each do |parent, children|
-          children.each do |child, edge|
-            association_kind, association = edge
-            parent_name = to_local_class_name(parent)
-            child_name = to_local_class_name(child)
-            g.add_nodes(parent_name)
-            g.add_nodes(child_name)
-            g.add_edges(parent_name, child_name, :label => "#{association_kind}")
-          end
-        end
-        @exceptions.each do |remote_class, association, association_kind, exception|
-          next if exception.is_a? MaxLevelReachedError
-          g.add_edges(to_local_class_name(remote_class), association.class_name, :label => "Exception: #{association_kind}")
-        end
-        g
-      end
-
-      def with_new_level
-        @level += 1
-        if options[:max_level] and level >= options[:max_level]
-          raise MaxLevelReachedError
-        end
-        yield
-        @level -= 1
-      end
-
-      def attributes_to_exclude(remote_class)
-        @attributes_to_exclude_map ||= {}
-        @attributes_to_exclude_map[remote_class.base_class] ||= calculate_attributes_to_exclude(remote_class)
-      end
-
-      def calculate_attributes_to_exclude(remote_class)
-        ((options[:exclude] && options[:exclude][remote_class.base_class]) || []).collect(&:to_sym)
-      end
-
-      def associations_to_follow(remote_class, association_kind)
-        excluded_attributes = attributes_to_exclude(remote_class)
-        remote_class.reflect_on_all_associations(association_kind).reject do |association|
-          association.options[:through] ||
-            excluded_attributes.include?(:all_associations) ||
-            excluded_attributes.include?(association.name) ||
-            (!association.options[:polymorphic] && options.fetch(:ignore_model, []).include?(to_local_class_name(association.klass)))
-        end
-      end
-
-      def add_association(parent, association, association_kind)
-        @nodes.add(parent)
-        @nodes.add(association.klass)
-
-        @edges[parent][association.klass] = [association_kind, association]
-      end
-
-      def has_association(parent, association, association_kind)
-        return @edges[parent][association.klass]
-      end
-
-      def follow_objects_associated_by_association_kind(remote_class, association_kind)
-        return if options.fetch(:ignore_model, []).include?(remote_class.base_class.name)
-        associations = associations_to_follow(remote_class, association_kind)
-        associations.each do |association|
-          begin
-            next if has_association(remote_class, association, association_kind)
-            add_association(remote_class, association, association_kind)
-            case association_kind
-            when :has_many, :has_one, :has_and_belongs_to_many
-              trace(association.klass)
-            when :belongs_to
-              with_new_level do
-                associations_to_follow(remote_class, :belongs_to).each do |association|
-                  next if has_association(remote_class, association, :belongs_to)
-                  trace(association.klass)
-                end
-              end
-            end
-          rescue Exception => e
-            @exceptions << [remote_class, association, association_kind, e]
-          end
-        end
-      end
-
-    end
-
     class DeepCopier
+      include Forceps::Utils
       attr_accessor :copied_remote_objects, :options, :level, :reused_local_objects
 
       def initialize(options)
@@ -243,10 +135,6 @@ module Forceps
         base_class
       end
 
-      def to_local_class_name(remote_class_name)
-        remote_class_name.gsub('Forceps::Remote::', '')
-      end
-
       def has_sti_column?(object)
         object.respond_to?(:type) && object.type.present? && object.type.is_a?(String)
       end
@@ -282,22 +170,12 @@ module Forceps
 
       def simple_attributes_to_copy(remote_object)
         remote_object.attributes.except('id').reject do |attribute_name|
-          attributes_to_exclude(remote_object).include? attribute_name.to_sym
+          attributes_to_exclude(remote_object.class).include? attribute_name.to_sym
         end
-      end
-
-      def attributes_to_exclude(remote_object)
-        @attributes_to_exclude_map ||= {}
-        @attributes_to_exclude_map[remote_object.class.base_class] ||= calculate_attributes_to_exclude(remote_object)
-      end
-
-      def calculate_attributes_to_exclude(remote_object)
-        ((options[:exclude] && options[:exclude][remote_object.class.base_class]) || []).collect(&:to_sym)
       end
 
       def copy_simple_attributes(target_local_object, source_remote_object)
         debug "#{as_trace(source_remote_object)} reusing..."
-        # update_columns skips callbacks too but not available in Rails 3
         copy_attributes(target_local_object, simple_attributes_to_copy(source_remote_object))
         target_local_object.save!(validate: false) unless options[:dry_run]
       end
@@ -328,19 +206,9 @@ module Forceps
 
       def copy_objects_associated_by_association_kind(local_object, remote_object, association_kind)
         return if options.fetch(:ignore_model, []).include?(remote_object.class.base_class.name)
-        associations = associations_to_copy(remote_object, association_kind)
+        associations = associations_to_follow(remote_object.class, association_kind)
         associations.each do |association|
           send "copy_associated_objects_in_#{association_kind}", local_object, remote_object, association
-        end
-      end
-
-      def associations_to_copy(remote_object, association_kind)
-        excluded_attributes = attributes_to_exclude(remote_object)
-        remote_object.class.reflect_on_all_associations(association_kind).reject do |association|
-          association.options[:through] ||
-            excluded_attributes.include?(:all_associations) ||
-            excluded_attributes.include?(association.name) ||
-            (!association.options[:polymorphic] && options.fetch(:ignore_model, []).include?(to_local_class_name(association.klass.name)))
         end
       end
 
@@ -357,7 +225,7 @@ module Forceps
 
       def copy_associated_objects_in_belongs_to(local_object, remote_object, association)
         with_new_level do
-          associations = associations_to_copy(remote_object, :belongs_to)
+          associations = associations_to_follow(remote_object.class, :belongs_to)
           associations.each do |association|
             remote_associated_object = remote_object.send(association.name)
             copy(remote_associated_object) if remote_associated_object
